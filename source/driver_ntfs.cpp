@@ -55,8 +55,62 @@ TDriverNTFS::~TDriverNTFS()
  ****************************************************************************************************************************************/
 int TDriverNTFS::LevantarDatosSuperbloque()
 {
-/* Salir */
-return(CODERROR_NO_IMPLEMENTADO);
+	/* El boot sector de NTFS se encuentra en el primer sector de la imagen. */
+	const NTFS_BOOT_SECTOR *Boot =
+		reinterpret_cast<const NTFS_BOOT_SECTOR *>(PunteroASector(0));
+
+	if (!Boot)
+		return(CODERROR_SUPERBLOQUE_INVALIDO);
+
+	/* OemSystem ocupa ocho bytes y no termina en '\0'. */
+	if (memcmp(Boot->OemSystem, "NTFS    ", 8) != 0)
+		return(CODERROR_FILESYSTEM_DESCONOCIDO);
+
+	/* Validar los campos necesarios para realizar los cálculos. */
+	if (Boot->BytesPerSector == 0 ||
+	    Boot->SectorsPerCluster == 0 ||
+	    Boot->SectorCount64 == 0)
+		return(CODERROR_SUPERBLOQUE_INVALIDO);
+
+	DatosFS.TipoFilesystem = tfsNTFS;
+	DatosFS.BytesPorSector = Boot->BytesPerSector;
+	DatosFS.BytesPorCluster = Boot->BytesPerSector * Boot->SectorsPerCluster;
+	DatosFS.NumeroDeClusters = Boot->SectorCount64 / Boot->SectorsPerCluster;
+
+	TDatosFSNTFS &NTFS = DatosFS.DatosEspecificos.NTFS;
+	NTFS.TotalSectores = Boot->SectorCount64;
+	NTFS.SectoresPorCluster = Boot->SectorsPerCluster;
+	NTFS.ClusterMFT = Boot->MasterFileTableCluster;
+	NTFS.ClusterMFTMirror = Boot->MasterFileTableMirrorCluster;
+	NTFS.OffsetParticionEnSectores = Boot->HiddenSectorCount;
+
+	/*
+	 * Un valor positivo expresa una cantidad de clusters. Un valor
+	 * negativo expresa una potencia de dos; por ejemplo, -10 es 2^10.
+	 */
+	auto CalcularTamano = [&](CHAR Valor) -> int {
+		signed char ValorConSigno = static_cast<signed char>(Valor);
+
+		if (ValorConSigno > 0)
+			return(ValorConSigno * DatosFS.BytesPorCluster);
+
+		if (ValorConSigno < 0 && ValorConSigno >= -30)
+			return(1U << (-ValorConSigno));
+
+		return(0);
+	};
+
+	NTFS.BytesPorFileRecordSegment =
+		CalcularTamano(Boot->ClustersPerRecord);
+	NTFS.BytesPorIndexBuffer =
+		CalcularTamano(Boot->ClustersPerIndexBuffer);
+
+	if (NTFS.BytesPorFileRecordSegment == 0 ||
+	    NTFS.BytesPorIndexBuffer == 0)
+		return(CODERROR_SUPERBLOQUE_INVALIDO);
+
+	/* Salir */
+	return(CODERROR_NINGUNO);
 }
 
 

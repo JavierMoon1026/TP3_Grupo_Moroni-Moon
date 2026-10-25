@@ -70,6 +70,38 @@ typedef unsigned int			ULONG;
 typedef unsigned long long		LONGLONG;
 typedef unsigned long long		ULONGLONG;
 
+/* Boot sector / BIOS Parameter Block de un volumen NTFS. */
+typedef struct __attribute__((packed))
+    {
+	UCHAR				Jump[3];
+	CHAR				OemSystem[8];
+	USHORT				BytesPerSector;
+	UCHAR				SectorsPerCluster;
+	USHORT				ReservedSectorCount;
+	UCHAR				TableCount;
+	USHORT				RootEntryCount;
+	USHORT				SectorCount;
+	UCHAR				MediaType;
+	USHORT				SectorsPerTable;
+	USHORT				SectorsPerTrack;
+	USHORT				Heads;
+	ULONG				HiddenSectorCount;
+	ULONG				SectorCount32;
+	ULONG				Reserved;
+	ULONGLONG			SectorCount64;
+	ULONGLONG			MasterFileTableCluster;
+	ULONGLONG			MasterFileTableMirrorCluster;
+	CHAR				ClustersPerRecord;
+	UCHAR				Reserved1[3];
+	CHAR				ClustersPerIndexBuffer;
+	UCHAR				Reserved2[3];
+	ULONGLONG			SerialNumber;
+	ULONG				Checksum;
+    }	NTFS_BOOT_SECTOR;
+
+static_assert(sizeof(NTFS_BOOT_SECTOR) == 84,
+	      "La cabecera NTFS documentada debe ocupar exactamente 84 bytes");
+
 /* Encabezado de un elemento del $MFT (sacado de learn.microsoft.com) */
 typedef struct __attribute__((packed))
     {
