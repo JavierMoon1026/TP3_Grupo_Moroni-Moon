@@ -1,0 +1,5 @@
+./fuse -f -o nonempty /network/privado/tpfs/aaa FAT32.bin
+
+./fuse -o nonempty /network/privado/tpfs/aaa FAT32.bin
+
+fusermount -u /network/privado/tpfs/aaa

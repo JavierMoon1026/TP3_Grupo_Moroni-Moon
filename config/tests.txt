@@ -1,0 +1,10 @@
+LS	/
+#LS	/DIR/DIR2
+#LS	/DirGrande
+#CAT /DIR/DIR2/MFTSTR~1.PDF
+CAT	/DIR/map.xml
+#CAT	/DIR/sparse.txt
+#CAT	/dir/test-ads.txt
+#CAT	/dir/test-ads.txt:stream2
+#CAT	/dir/test-ads.txt:stream3
+#CAT	/DIR/sparse-file2.txt

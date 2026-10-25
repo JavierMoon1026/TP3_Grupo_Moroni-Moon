@@ -1,0 +1,12 @@
+schema: "classroom50/repo-config/v1"
+classroom: "acso"
+assignment: "tp3"
+owner:
+  username: "tchimenti"
+  id: 98756563
+  accepted_at: "2026-10-17T23:55:40Z"
+source:
+  owner: "ACSO-UDESA"
+  owner_id: 264473203
+  repo: "acso-2do-semestre-2026-tp3-fs"
+  branch: "main"

@@ -1,0 +1,29 @@
+﻿#ifndef	__MAIN__H__
+#define	__MAIN__H__
+
+/************************
+ *			*
+ *     Constantes	*
+ *			*
+ ************************/
+/* Posibles códigos de error */
+#define	CODERROR_NINGUNO			  0
+#define	CODERROR_PARAMETROS_INVALIDOS		- 1
+#define	CODERROR_ARCHIVO_INEXISTENTE		- 2
+#define	CODERROR_ARCHIVO_INVALIDO		- 3
+#define	CODERROR_FALTA_MEMORIA			- 4
+#define	CODERROR_LECTURA_DISCO			- 5
+#define	CODERROR_FALTA_ARCHIVO_DE_COMANDOS	- 6
+#define CODERROR_COMANDO_DESCONOCIDO		- 7
+#define CODERROR_COMANDO_CON_ERRORES		- 8
+#define	CODERROR_NO_IMPLEMENTADO		- 9
+#define	CODERROR_SUPERBLOQUE_INVALIDO		-10
+#define	CODERROR_FILESYSTEM_DESCONOCIDO		-11
+#define	CODERROR_FILESYSTEM_CORRUPTO		-12
+#define	CODERROR_DIRECTORIO_INEXISTENTE		-13
+#define	CODERROR_RUTA_NO_ABSOLUTA		-14
+
+#define	CODERROR_ALUMNO				-1000
+
+
+#endif

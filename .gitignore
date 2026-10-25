@@ -1,0 +1,22 @@
+# Compilados
+object/*
+!object/.gitkeep
+tpfs
+
+# Imágenes de disco
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
