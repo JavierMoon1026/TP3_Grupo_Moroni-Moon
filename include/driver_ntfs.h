@@ -70,7 +70,7 @@ typedef unsigned int			ULONG;
 typedef unsigned long long		LONGLONG;
 typedef unsigned long long		ULONGLONG;
 
-/* Boot sector / BIOS Parameter Block de un volumen NTFS. */
+/* Boot sector de un volumen NTFS */
 typedef struct __attribute__((packed))
     {
 	UCHAR				Jump[3];
@@ -302,6 +302,7 @@ typedef struct
     {
 	LCN		Inicio;
 	unsigned	Cantidad;
+	bool		Disperso;
     }	TDataRun;
 
 /* Estructura usada para devolver bloques de memoria alocados */
@@ -344,7 +345,20 @@ public:
 	virtual int			LevantarDatosSuperbloque();
 	virtual int 			ListarDirectorio(const char *Path, std::vector<TEntradaDirectorio> &Entradas);
 	virtual int 			LeerArchivo(const char *Path, unsigned char *&Data, unsigned &DataLen);
-	
+
+protected:
+	/* Helpers para leer registros y atributos de la MFT */
+	virtual int			LeerBytesDeImagen(__u64 Offset, unsigned char *Destino, __u64 Cantidad);
+	virtual int			AplicarFixups(unsigned char *Registro, unsigned TamanoRegistro);
+	virtual ATTRIBUTE_RECORD_HEADER	*BuscarAtributo(unsigned char *Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo);
+	virtual int			DecodificarDataRuns(const ATTRIBUTE_RECORD_HEADER *Atributo, std::vector<TDataRun> &DataRuns);
+	virtual int			LeerDesdeDataRuns(const std::vector<TDataRun> &DataRuns, __u64 Offset, unsigned char *Destino, __u64 Cantidad);
+	virtual int			LeerContenidoAtributo(const ATTRIBUTE_RECORD_HEADER *Atributo, std::vector<unsigned char> &Contenido);
+	virtual int			InicializarMFT();
+	virtual int			LeerRegistroMFT(__u64 Indice, std::vector<unsigned char> &Registro);
+
+	std::vector<TDataRun>		DataRunsMFT;
+	bool				MFTInicializada;
 };
 
 #endif
