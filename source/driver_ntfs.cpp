@@ -75,10 +75,12 @@ int TDriverNTFS::LevantarDatosSuperbloque()
 	DatosFS.TipoFilesystem = tfsNTFS;
 	DatosFS.BytesPorSector = Boot->BytesPerSector;
 	DatosFS.BytesPorCluster = Boot->BytesPerSector * Boot->SectorsPerCluster;
-	DatosFS.NumeroDeClusters = Boot->SectorCount64 / Boot->SectorsPerCluster;
+	// Acá había un error de reporte, estaba desfasado con 1 por debajo. Le sumás uno y chau.
+	DatosFS.NumeroDeClusters = Boot->SectorCount64 / Boot->SectorsPerCluster + 1;
 
 	TDatosFSNTFS &NTFS = DatosFS.DatosEspecificos.NTFS;
-	NTFS.TotalSectores = Boot->SectorCount64;
+	// Igual que arriba; desfasado con 1 por debajo. De nuevo, sumás uno y chau.
+	NTFS.TotalSectores = Boot->SectorCount64 + 1;
 	NTFS.SectoresPorCluster = Boot->SectorsPerCluster;
 	NTFS.ClusterMFT = Boot->MasterFileTableCluster;
 	NTFS.ClusterMFTMirror = Boot->MasterFileTableMirrorCluster;
