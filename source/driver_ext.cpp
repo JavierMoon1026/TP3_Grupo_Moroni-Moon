@@ -53,10 +53,14 @@ TDriverEXT::~TDriverEXT()
  *						  clase.										*
  *																	*
  ****************************************************************************************************************************************/
-int TDriverEXT::LevantarDatosSuperbloque()
+int TDriverFAT::LevantarDatosSuperbloque()
 {
-/* Salir */
-return(CODERROR_NO_IMPLEMENTADO);
+/* Este driver no está implementado porque nos asignaron el NTFS.
+   Hay que devolver CODERROR_FILESYSTEM_DESCONOCIDO para que el analizador
+   continúe probando los drivers siguientes. Si se devolviera
+   CODERROR_NO_IMPLEMENTADO, el analizador tomaría la imagen como compatible
+   con este driver, lo seleccionaría y el driver NTFS nunca se llegar a probar. */
+return(CODERROR_FILESYSTEM_DESCONOCIDO);
 }
 
 
