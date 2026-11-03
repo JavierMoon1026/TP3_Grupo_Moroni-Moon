@@ -52,6 +52,16 @@
 #define	NTFS_DIRECTORY				0x10000000	// Directory (copy from corresponding bit in MFT record)
 #define	NTFS_INDEX_VIEW				0x20000000	// Index View (copy from corresponding bit in MFT record)
 
+/*
+	Esto lo necesitaba agregar para la parte 2. Queda más lindo.
+*/
+// Flags del encabezado de un registro del $MFT (FILE_RECORD_SEGMENT_HEADER.Flags).
+#define NTFS_RECORD_ES_DIRECTORIO 0x0002 // El registro es un directorio (tiene índice $I30).
+
+// Flags de una entrada de índice (INDEX_RECORD.Flags).
+#define NTFS_INDEX_ENTRADA_TIENE_SUBNODO 0x01 // Los últimos 8 bytes de la entrada tienen el VCN del hijo.
+#define NTFS_INDEX_ENTRADA_FIN 0x02 // Última entrada del nodo (no tiene datos).
+
 
 
 /************************
@@ -305,6 +315,13 @@ typedef struct
 	bool		Disperso;
     }	TDataRun;
 
+/* Esto es para la parte 2: Búsqueda de un nombre dentro del índice de un directorio (usada por ResolverPath) */
+typedef struct {
+	TString Nombre; // Componente del path a buscar (UTF-8).
+	bool Encontrado; // True si alguna entrada del índice coincide.
+	__u64 IndiceMFT; // Registro MFT de la entrada encontrada.
+} TBusquedaNombre;
+
 /* Estructura usada para devolver bloques de memoria alocados */
 typedef struct
     {
@@ -356,6 +373,16 @@ protected:
 	virtual int			LeerContenidoAtributo(const ATTRIBUTE_RECORD_HEADER *Atributo, std::vector<unsigned char> &Contenido);
 	virtual int			InicializarMFT();
 	virtual int			LeerRegistroMFT(__u64 Indice, std::vector<unsigned char> &Registro);
+
+	/* Más helpers de navegación de directorios (Para la parte 2) */
+	virtual int ColectoraListarEntradas(INDEX_RECORD * EntradaIndice, void * pParametroUsuario);
+	virtual int ColectoraBuscarNombre(INDEX_RECORD * EntradaIndice, void * pParametroUsuario);
+	virtual ATTRIBUTE_RECORD_HEADER *BuscarAtributoEnLista(unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo, const char * Nombre, std::vector<unsigned char> & BufferExtension);
+	virtual int ObtenerDataRunsAtributo(unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo, const char * Nombre, std::vector<TDataRun> & DataRuns);
+	virtual int CargarNodoIndice(__u64 VCN, const std::vector<TDataRun> & DataRunsAllocacion, unsigned TamanoNodoIndice, std::vector<unsigned char> & Nodo);
+	virtual int EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigned OffsetEncabezado, const std::vector<TDataRun> & DataRunsAllocacion, unsigned TamanoNodoIndice, TpColectoraDatosIndice pFuncion, void * pParametroUsuario, unsigned Nivel);
+	virtual int EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistro, TpColectoraDatosIndice pFuncion, void * pParametroUsuario);
+	virtual int ResolverPath(const char * Path, __u64 & IndiceMFT);
 
 	std::vector<TDataRun>		DataRunsMFT;
 	bool				MFTInicializada;
