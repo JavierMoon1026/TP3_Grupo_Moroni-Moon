@@ -386,10 +386,386 @@ int TDriverNTFS::LeerRegistroMFT(__u64 Indice, std::vector<unsigned char> &Regis
  *	   Entradas: Arreglo con cada una de las entradas.										*
  *																	*
  ****************************************************************************************************************************************/
+
+/*
+	~~~ | ~~~
+	Primero vamos a comenzar por unas funciones auxiliares nashe. Estas son para traducir cosas del File System
+	al código, así se entienden mutuamente, como un traductor digamos.
+	~~~ | ~~~
+*/
+
+// Esta bad bitch convierte un nombre UTF-16LE a uno UTF-8. O sea, de lo que usa la NFT a la que usa el código.
+static TString UTF16aUTF8(const WCHAR * Nombre, UCHAR Largo) {
+	TString Resultado;
+	Resultado.reserve(Largo);
+	for (unsigned i = 0; i < Largo; ) {
+		unsigned Punto = Nombre[i++];
+		// Par sustituto, son dos WCHAR juntos codifican un punto de código mayor a 0xFFFF.
+		if (Punto >= 0xD800 && Punto <= 0xDBFF && i < Largo && Nombre[i] >= 0xDC00 && Nombre[i] <= 0xDFFF)
+			Punto = 0x10000 + ((Punto - 0xD800) << 10) + (Nombre[i++] - 0xDC00);
+		if (Punto < 0x80) {
+			Resultado += (char)Punto;
+		} else if (Punto < 0x800) {
+			Resultado += (char)(0xC0 | (Punto >> 6));
+			Resultado += (char)(0x80 | (Punto & 0x3F));
+		} else if (Punto < 0x10000) {
+			Resultado += (char)(0xE0 | (Punto >> 12));
+			Resultado += (char)(0x80 | ((Punto >> 6) & 0x3F));
+			Resultado += (char)(0x80 | (Punto & 0x3F));
+		} else {
+			Resultado += (char)(0xF0 | (Punto >> 18));
+			Resultado += (char)(0x80 | ((Punto >> 12) & 0x3F));
+			Resultado += (char)(0x80 | ((Punto >> 6) & 0x3F));
+			Resultado += (char)(0x80 | (Punto & 0x3F));
+		}
+	}
+	return Resultado;
+}
+
+// Esta otra se encarga de mostrar el tiempo correctamente, porque NFTS guarda las fechas de forma diferente,
+// empezando desde el año 1600 y pico.
+static time_t TicksAFecha(ULONGLONG Ticks) {
+	// El numerito mágico. Esta es la cantidad de segundos entre el mil y pico y los 70.
+    const __s64 DiferenciaEntreEpochs=116444736000000000LL;
+    return (time_t)(((__s64)Ticks - DiferenciaEntreEpochs) / 10000000LL);
+}
+
+// Esta también es útil, porque traduce los atributos de un registro a flags que entienda nuestro programa.
+static unsigned TraducirFlags(ULONG FileAttributes) {
+	unsigned Flags = 0;
+	if (FileAttributes & NTFS_READ_ONLY) Flags |= fedSOLO_LECTURA;
+	if (FileAttributes & NTFS_HIDDEN) Flags |= fedOCULTO;
+	if (FileAttributes & NTFS_SYSTEM) Flags |= fedSISTEMA;
+	if (FileAttributes & NTFS_DIRECTORY) Flags |= fedDIRECTORIO;
+	if (FileAttributes & NTFS_ARCHIVE) Flags |= fedARCHIVAR;
+	if (FileAttributes & NTFS_COMPRESSED) Flags |= fedCOMPRIMIDO;
+	if (FileAttributes & NTFS_ENCTRYPTED) Flags |= fedENCRIPTADO;
+	if (FileAttributes & NTFS_SPARSE_FILE) Flags |= fedDISPERSO;
+	return Flags;
+}
+
+/*
+	~~~ | ~~~
+	Ahora vamos con las funciones auxiliares del árbol B Tree que usa internamente el sistema de NFTS para los
+	directorios. Después, seguirán las funciones propiamente dichas de eso.
+	~~~ | ~~~
+*/
+
+// Esta simplemente compara dos nombres ingnorando mayúsculas o minúsculas.
+// A la NFTS no le importa, es case-insensitive.
+static bool NombresIguales(const TString & A, const TString & B) {
+	if (A.size() != B.size()) return false;
+	for (size_t i = 0; i < A.size(); i++) {
+		if (tolower((unsigned char)A[i]) != tolower((unsigned char)B[i])) return false;
+	}
+	return true;
+}
+
+// Si el atributo no tiene nombre o coincide con el pedido, devuelve true.
+static bool AtributoCoincideNombre(const ATTRIBUTE_RECORD_HEADER * Atributo, const char * Nombre) {
+	if (!Nombre || !Nombre[0]) return true; // O no me dieron un atributo o no me dieron un nombre. Nada para buscar.
+	if (Atributo->NameLength == 0) return false; // Me pidieron un nombre, pero el atributo no tiene nada.
+	const WCHAR * NombreAtributo = reinterpret_cast<const WCHAR *>(reinterpret_cast<const unsigned char *>(Atributo) + Atributo->NameOffset);
+	for (unsigned i = 0; i < Atributo->NameLength; i++) {
+		if (!Nombre[i] || (unsigned char)Nombre[i] != (unsigned char)NombreAtributo[i]) return false;
+	}
+	return Nombre[Atributo->NameLength] == '\0';
+}
+
+/* El bit 1 de FILE_RECORD_SEGMENT_HEADER.Flags marca los registros que son directorios */
+// Y esta otra te dice si el registro es un directorio o no.
+static bool RegistroEsDirectorio(const unsigned char * Registro) {
+	const FILE_RECORD_SEGMENT_HEADER * Encabezado = reinterpret_cast<const FILE_RECORD_SEGMENT_HEADER *>(Registro);
+	return (Encabezado->Flags & NTFS_RECORD_ES_DIRECTORIO) != 0;
+}
+
+/*
+	~~~ | ~~~
+	Estas son las funciones para poder recorrer los paths propiamente dichos. El NFTS funciona como un B Tree, entonces
+	es necesario implementar ese mismo tipo de lógica.
+	~~~ | ~~~
+*/
+
+// Es como la función para buscar un atributo, pero si no lo encuentra en el registro base, lo va a buscar en los
+// registros de extensión. Devuelve el puntero al atributo.
+ATTRIBUTE_RECORD_HEADER * TDriverNTFS::BuscarAtributoEnLista(unsigned char * Registro, unsigned TamanoRegistro,
+					ATTRIBUTE_TYPE_CODE Tipo, const char * Nombre, std::vector<unsigned char> & BufferExtension) {
+
+	// Primero, está en el registro base?
+	ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(Registro, TamanoRegistro, Tipo);
+	if (Atributo && AtributoCoincideNombre(Atributo, Nombre)) return Atributo;
+
+	// Si los archivos muy grandes guardan algunos atributos en registros de extensión.
+	ATTRIBUTE_RECORD_HEADER * AttrLista = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
+	if (!AttrLista) return NULL;
+
+	std::vector<unsigned char> Contenido;
+	if (LeerContenidoAtributo(AttrLista, Contenido) != CODERROR_NINGUNO) return NULL;
+	for (unsigned Offset = 0; Offset + 26 <= Contenido.size(); ) {
+		const ATTRIBUTE_LIST_ENTRY * Entrada = reinterpret_cast<const ATTRIBUTE_LIST_ENTRY *>(Contenido.data() + Offset);
+		if (Entrada->TypeCode == NTFS_STRUCT_END || Entrada->RecordLength < 26 || Offset + Entrada->RecordLength > Contenido.size()) break;
+		if (Entrada->TypeCode == Tipo) {
+			// Carga el registro que contiene el atributo y lo busca en ese lugar.
+			std::vector<unsigned char> RegistroExtension;
+			if (LeerRegistroMFT(Entrada->SegmentReference.MFTIndex, RegistroExtension) == CODERROR_NINGUNO) {
+				ATTRIBUTE_RECORD_HEADER * Hallado = BuscarAtributo(RegistroExtension.data(), RegistroExtension.size(), Tipo);
+				if (Hallado && AtributoCoincideNombre(Hallado, Nombre)) {
+					BufferExtension = std::move(RegistroExtension);
+					return Hallado;
+				}
+			}
+		}
+		Offset += Entrada->RecordLength;
+	}
+	return NULL;
+}
+
+// Esta función consigue los DataRuns completos de un atributo que se no residente. Si tuviera un attribute list,
+// se recorren todos sus fragmentos y se concatenan sus DataRuns.
+int TDriverNTFS::ObtenerDataRunsAtributo(unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo,
+										 const char * Nombre, std::vector<TDataRun> & DataRuns) {
+	DataRuns.clear();
+
+	// Este es el caso simple, no hay lista de atributos, entonces, todo está en el registro base.
+	ATTRIBUTE_RECORD_HEADER * AttrLista = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
+	if (!AttrLista) {
+		ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(Registro, TamanoRegistro, Tipo);
+		if (!Atributo || !Atributo->NonResidentFlag || !AtributoCoincideNombre(Atributo, Nombre)) return CODERROR_NO_ENCONTRADO;
+		return DecodificarDataRuns(Atributo, DataRuns);
+	}
+
+	// Este sería el caso más difícil, recorrer la lista de atributos.
+	std::vector<unsigned char> Contenido;
+	int CodError = LeerContenidoAtributo(AttrLista, Contenido);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+	for (unsigned Offset = 0; Offset + 26 <= Contenido.size(); ) {
+		const ATTRIBUTE_LIST_ENTRY * Entrada = reinterpret_cast<const ATTRIBUTE_LIST_ENTRY *>(Contenido.data() + Offset);
+		if (Entrada->TypeCode == NTFS_STRUCT_END || Entrada->RecordLength < 26 || Offset + Entrada->RecordLength > Contenido.size()) break;
+
+		// Sólo el fragmento con LowestVcn = 0 arranca desde el principio, si no, acumulan clusters y se procesan en el orden de la lstita.
+		if (Entrada->TypeCode == Tipo) {
+			std::vector<unsigned char> RegistroFragmento;
+			if (LeerRegistroMFT(Entrada->SegmentReference.MFTIndex, RegistroFragmento) != CODERROR_NINGUNO) return CODERROR_FILESYSTEM_CORRUPTO;
+
+			// El registro base también aparece en la lista, vovler a cargarlo no hace nada.
+			ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(RegistroFragmento.data(), RegistroFragmento.size(), Tipo);
+			if (!Atributo || !Atributo->NonResidentFlag || !AtributoCoincideNombre(Atributo, Nombre)) return CODERROR_FILESYSTEM_CORRUPTO;
+			std::vector<TDataRun> RunsFragmento;
+			CodError = DecodificarDataRuns(Atributo, RunsFragmento);
+			if (CodError != CODERROR_NINGUNO) return CodError;
+
+			DataRuns.insert(DataRuns.end(), RunsFragmento.begin(), RunsFragmento.end());
+		}
+		Offset += Entrada->RecordLength;
+	}
+	if (DataRuns.empty()) return CODERROR_NO_ENCONTRADO;
+	return CODERROR_NINGUNO;
+}
+
+// Esta función carga en memoria todo el nodo apuntado por el VCN de una entrada con subnodo. Ojo que el VCN está en unidades de cluster,
+// entonces el offeset dentro del index allocation es con una operación matemática adicional.
+int TDriverNTFS::CargarNodoIndice(__u64 VCN, const std::vector<TDataRun> & DataRunsAllocacion,
+								 unsigned TamanoNodoIndice, std::vector<unsigned char> & Nodo) {
+	if (TamanoNodoIndice<(unsigned)DatosFS.BytesPorSector || TamanoNodoIndice % (unsigned)DatosFS.BytesPorSector != 0 ||
+		DatosFS.BytesPorCluster <= 0 || DataRunsAllocacion.empty()) return CODERROR_FILESYSTEM_CORRUPTO;
+	Nodo.resize(TamanoNodoIndice);
+
+	// No olvidar que el VCN está en unidades de cluster y no de buffer.
+	int CodError = LeerDesdeDataRuns(DataRunsAllocacion, VCN * (__u64)DatosFS.BytesPorCluster, Nodo.data(), TamanoNodoIndice);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+
+	CodError = AplicarFixups(Nodo.data(), TamanoNodoIndice);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+	if (memcmp(Nodo.data(), "INDX", 4) != 0) return(CODERROR_FILESYSTEM_CORRUPTO);
+
+	// El VCN declarado por el buffer debe ser el pedido.
+	FILE_RECORD_INDEX_HEADER * Encabezado = reinterpret_cast<FILE_RECORD_INDEX_HEADER *>(Nodo.data());
+	if (Encabezado->IndexVCN != VCN) return(CODERROR_FILESYSTEM_CORRUPTO);
+	return(CODERROR_NINGUNO);
+}
+
+// Esta función recorre las entradas de un nodo del índice en preorder. Ojo que los nodos internos también guardan entradas reales.
+int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigned OffsetEncabezado, const std::vector<TDataRun> & DataRunsAllocacion,
+	unsigned TamanoNodoIndice, TpColectoraDatosIndice pFuncion, void * pParametroUsuario, unsigned Nivel) {
+
+        if (!Nodo || Nivel > 64 || OffsetEncabezado + sizeof(IDX_HEADER)>TamanoNodo) return CODERROR_FILESYSTEM_CORRUPTO;
+
+        IDX_HEADER * Encabezado = reinterpret_cast<IDX_HEADER *>(Nodo + OffsetEncabezado);
+        unsigned Offset = OffsetEncabezado + Encabezado->OffsetFirstEntry;
+        unsigned Fin = OffsetEncabezado + Encabezado->IndexEntriesUsed;
+        while (Offset + offsetof(INDEX_RECORD, Data) <= Fin && Offset + offsetof(INDEX_RECORD, Data) <= TamanoNodo) {
+			INDEX_RECORD * Entrada = reinterpret_cast<INDEX_RECORD *>(Nodo + Offset);
+			if (Entrada->RecordLength<offsetof(INDEX_RECORD, Data) || Offset + Entrada->RecordLength>TamanoNodo) return CODERROR_FILESYSTEM_CORRUPTO;
+
+			// Primero se reporta la entrada.
+			if (!(Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) && Entrada->StreamLength > 0) {
+				int CodError = (this->*pFuncion)(Entrada, pParametroUsuario);
+				if (CodError != CODERROR_NINGUNO) return CodError;
+			}
+
+			// Ahora, si la entrada tiene putnero, se baja al subnodo.
+			if (Entrada->Flags & NTFS_INDEX_ENTRADA_TIENE_SUBNODO) {
+				if (Entrada->RecordLength<sizeof(ULONGLONG)) return CODERROR_FILESYSTEM_CORRUPTO;
+
+				ULONGLONG VCN;
+				memcpy(&VCN, reinterpret_cast<unsigned char *>(Entrada) + Entrada->RecordLength-sizeof(ULONGLONG), sizeof(VCN));
+				std::vector<unsigned char> Subnodo;
+				int CodError = CargarNodoIndice(VCN, DataRunsAllocacion, TamanoNodoIndice, Subnodo);
+				if (CodError != CODERROR_NINGUNO) return CodError;
+
+				// En un buffer de índice, el idx header está dentro del offset 24.
+				CodError = EnumerarNodo(Subnodo.data(), Subnodo.size(), offsetof(FILE_RECORD_INDEX_HEADER, Header), DataRunsAllocacion, TamanoNodoIndice,
+										pFuncion, pParametroUsuario, Nivel + 1);
+				if (CodError != CODERROR_NINGUNO) return CodError;
+			}
+
+			if (Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) break;
+			Offset += Entrada->RecordLength;
+        }
+        return CODERROR_NINGUNO;
+}
+
+// Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leídoy tiene los fixup aplicados. El nodo raíz del árbol
+// vive en el index_root, como residete.
+int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistro, TpColectoraDatosIndice pFuncion, void * pParametroUsuario) {
+	// Como el index_root siempre es residente, si no está en el registro base, se busca en los de extensión.
+	std::vector<unsigned char> BufferExtension;
+	unsigned char * NodoRaiz = Registro;
+	unsigned TamanoRaiz = TamanoRegistro;
+	ATTRIBUTE_RECORD_HEADER * IndexRoot = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT);
+
+	if (!IndexRoot) {
+		IndexRoot = BuscarAtributoEnLista(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT, "$I30", BufferExtension);
+		if (!IndexRoot) return CODERROR_FILESYSTEM_CORRUPTO;
+		NodoRaiz = BufferExtension.data();
+		TamanoRaiz = BufferExtension.size();
+	}
+	if (IndexRoot->NonResidentFlag) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	unsigned OffsetAtributo = (unsigned)(reinterpret_cast<unsigned char *>(IndexRoot) - NodoRaiz);
+	unsigned OffsetValor = OffsetAtributo + IndexRoot->Form.Resident.ValueOffset;
+	if (IndexRoot->Form.Resident.ValueOffset + IndexRoot->Form.Resident.ValueLength>IndexRoot->RecordLength ||
+		OffsetValor + sizeof(IDX_ROOT) + sizeof(IDX_HEADER) > TamanoRaiz) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	const IDX_ROOT *Raiz=reinterpret_cast<const IDX_ROOT *>(NodoRaiz+OffsetValor); // Es de este índice nomás, no siempre coincide con el boot.
+	unsigned TamanoNodoIndice = Raiz->IndexAllocationEntrySize;
+	if (TamanoNodoIndice < (unsigned)DatosFS.BytesPorSector || TamanoNodoIndice % (unsigned)DatosFS.BytesPorSector != 0) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	// Si el índice es chico, el atributo no existe y sus entradas están en el index_root.
+	std::vector<TDataRun> DataRunsAllocacion;
+	int CodError = ObtenerDataRunsAtributo(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ALLOCATION, "$I30", DataRunsAllocacion);
+	if (CodError == CODERROR_FILESYSTEM_CORRUPTO) return CodError;
+	unsigned OffsetEncabezado = OffsetValor + sizeof(IDX_ROOT);
+	return EnumerarNodo(NodoRaiz, TamanoRaiz, OffsetEncabezado, DataRunsAllocacion, TamanoNodoIndice, pFuncion, pParametroUsuario, 0);
+}
+
+// Por cada index records, arma una entrada. Todos los datos salen del file name que está en la propia entrada del índice.
+int TDriverNTFS::ColectoraListarEntradas(INDEX_RECORD * EntradaIndice, void * pParametroUsuario) {
+	std::vector<TEntradaDirectorio> * Entradas = reinterpret_cast<std::vector<TEntradaDirectorio> *>(pParametroUsuario);
+	if (EntradaIndice->StreamLength < offsetof(FILE_NAME, FileName)) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	FILE_NAME * Nombre = reinterpret_cast<FILE_NAME *>(EntradaIndice->Data);
+	if (EntradaIndice->StreamLength<offsetof(FILE_NAME, FileName) + 2 * Nombre->FileNameLength) return CODERROR_FILESYSTEM_CORRUPTO;
+	const WCHAR * TextoNombre = reinterpret_cast<const WCHAR *>(reinterpret_cast<const unsigned char *>(Nombre) + offsetof(FILE_NAME, FileName));
+	TEntradaDirectorio Entrada = {};
+
+	// Y todo esto sale del file name, de la propia entrada del índice.
+	Entrada.Nombre = UTF16aUTF8(TextoNombre, Nombre->FileNameLength);
+	Entrada.Flags = TraducirFlags(Nombre->FileAttributes);
+	Entrada.Bytes = Nombre->RealSize;
+	Entrada.FechaCreacion = TicksAFecha(Nombre->UTCCreation);
+	Entrada.FechaUltimoAcceso = TicksAFecha(Nombre->UTCRLastAccesed);
+	Entrada.FechaUltimaModificacion = TicksAFecha(Nombre->UTCModification);
+	Entrada.DatosEspecificos.NTFS.IndiceMFT = EntradaIndice->FileReference.MFTIndex;
+	Entrada.DatosEspecificos.NTFS.NroSecuencia = EntradaIndice->FileReference.Sequence;
+	
+	Entradas->push_back(Entrada);
+	return CODERROR_NINGUNO;
+}
+
+// Esta otra función compara el nombre de cada entrada del índice con el componente de path buscado. Igual que antes, es case-insensitve.
+int TDriverNTFS::ColectoraBuscarNombre(INDEX_RECORD *EntradaIndice, void * pParametroUsuario) {
+	TBusquedaNombre * Busqueda = reinterpret_cast<TBusquedaNombre *>(pParametroUsuario);
+	if (Busqueda->Encontrado) return CODERROR_NINGUNO;
+	if (EntradaIndice->StreamLength<offsetof(FILE_NAME, FileName)) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	FILE_NAME * Nombre = reinterpret_cast<FILE_NAME *>(EntradaIndice->Data);
+	if (EntradaIndice->StreamLength<offsetof(FILE_NAME, FileName) + 2 * Nombre->FileNameLength) return CODERROR_FILESYSTEM_CORRUPTO;
+
+	const WCHAR * TextoNombre = reinterpret_cast<const WCHAR *>(reinterpret_cast<const unsigned char *>(Nombre) + offsetof(FILE_NAME, FileName));
+	TString Candidato = UTF16aUTF8(TextoNombre, Nombre->FileNameLength);
+	if (NombresIguales(Candidato, Busqueda->Nombre)) {
+		Busqueda->Encontrado = true;
+		Busqueda->IndiceMFT = EntradaIndice->FileReference.MFTIndex;
+	}
+	return CODERROR_NINGUNO;
+}
+
+// Esta función resuelve un path absoluto en el número de registro de la MFT del elemento final. Empieza desde el registro 5 (La raíz)
+// y por cada componente del path, busca el nombre en el índice del directorio actual, bajando al registro MFT encontrado.
+int TDriverNTFS::ResolverPath(const char * Path, __u64 & IndiceMFT) {
+	IndiceMFT = NTFS_ELEM_ROOT_DIR;
+	if (!Path || Path[0] != '/') return CODERROR_RUTA_NO_ABSOLUTA;
+
+	std::vector<unsigned char> Registro;
+	int CodError = LeerRegistroMFT(IndiceMFT, Registro);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+	
+	const char * Inicio = Path;
+	while (*Inicio) {
+		// Nos saltamos las barras, sean iniciales, repetidas o finales.
+		while (*Inicio == '/') Inicio++;
+		if (!*Inicio) break;
+
+		const char * Fin = Inicio;
+		while (*Fin && *Fin != '/') Fin++;
+
+		TString Componente(Inicio, Fin - Inicio);
+		Inicio = Fin;
+
+		// Ahora, buscamos el componente en el índice del directorio acutal.
+		TBusquedaNombre Busqueda;
+		Busqueda.Nombre = Componente;
+		Busqueda.Encontrado = false;
+		Busqueda.IndiceMFT = 0;
+		CodError = EnumerarIndice(Registro.data(), Registro.size(), &TDriverNTFS::ColectoraBuscarNombre, &Busqueda);
+		if (CodError != CODERROR_NINGUNO) return CodError;
+		if (!Busqueda.Encontrado) return CODERROR_DIRECTORIO_INEXISTENTE;
+		IndiceMFT = Busqueda.IndiceMFT;
+
+		// Si quedan más componentes, seguimos bajando por este registro.
+		const char * Resto = Inicio;
+		while (*Resto == '/') Resto++;
+		if (!*Resto) break;
+		CodError = LeerRegistroMFT(IndiceMFT, Registro);
+		if (CodError != CODERROR_NINGUNO) return CodError;
+
+		// Para poder bajar a otro nivel, el componente encontrado tiene que ser un directorio.
+		if (!RegistroEsDirectorio(Registro.data())) return CODERROR_DIRECTORIO_INEXISTENTE;
+	}
+	return(CODERROR_NINGUNO);
+}
+
+// Y así llegamos a la tan esperada maldita...
 int TDriverNTFS::ListarDirectorio(const char *Path, std::vector<TEntradaDirectorio> &Entradas)
 {
-/* Salir */
-return(CODERROR_NO_IMPLEMENTADO);
+	Entradas.clear();
+
+	// 1. Resolvemos el path: arrancamos en la raíz y bajamos por los índices.
+	__u64 IndiceMFT;
+	int CodError = ResolverPath(Path, IndiceMFT);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+
+	// 2. Leemos el registro MFT del directorio a listar.
+	std::vector<unsigned char> Registro;
+	CodError = LeerRegistroMFT(IndiceMFT, Registro);
+	if (CodError != CODERROR_NINGUNO) return CodError;
+
+	// 3. Revisamos que el archivo no tenga el índice I30, porque sólo se pueden listar directorios.
+	if (!RegistroEsDirectorio(Registro.data())) return CODERROR_DIRECTORIO_INEXISTENTE;
+
+	// 4. Ahora sí, recorremos el índice I30 completo, llenando una entrada por cada nombre.
+	return EnumerarIndice(Registro.data(), Registro.size(), &TDriverNTFS::ColectoraListarEntradas, &Entradas);
 }
 
 
