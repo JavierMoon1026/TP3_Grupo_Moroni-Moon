@@ -53,7 +53,7 @@ TDriverEXT::~TDriverEXT()
  *						  clase.										*
  *																	*
  ****************************************************************************************************************************************/
-int TDriverFAT::LevantarDatosSuperbloque()
+int TDriverEXT::LevantarDatosSuperbloque()
 {
 /* Este driver no está implementado porque nos asignaron el NTFS.
    Hay que devolver CODERROR_FILESYSTEM_DESCONOCIDO para que el analizador
