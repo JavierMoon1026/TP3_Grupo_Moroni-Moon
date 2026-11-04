@@ -461,15 +461,37 @@ static bool NombresIguales(const TString & A, const TString & B) {
 	return true;
 }
 
-// Si el atributo no tiene nombre o coincide con el pedido, devuelve true.
+// Los atributos sin nombre y los streams con nombre son $DATA diferentes.
 static bool AtributoCoincideNombre(const ATTRIBUTE_RECORD_HEADER * Atributo, const char * Nombre) {
-	if (!Nombre || !Nombre[0]) return true; // O no me dieron un atributo o no me dieron un nombre. Nada para buscar.
-	if (Atributo->NameLength == 0) return false; // Me pidieron un nombre, pero el atributo no tiene nada.
-	const WCHAR * NombreAtributo = reinterpret_cast<const WCHAR *>(reinterpret_cast<const unsigned char *>(Atributo) + Atributo->NameOffset);
-	for (unsigned i = 0; i < Atributo->NameLength; i++) {
-		if (!Nombre[i] || (unsigned char)Nombre[i] != (unsigned char)NombreAtributo[i]) return false;
+	TString NombreBuscado=Nombre ? Nombre : "";
+	if (!Atributo->NameLength) return NombreBuscado.empty();
+	const WCHAR * NombreAtributo=reinterpret_cast<const WCHAR *>(
+		reinterpret_cast<const unsigned char *>(Atributo)+Atributo->NameOffset);
+	return UTF16aUTF8(NombreAtributo, Atributo->NameLength)==NombreBuscado;
+}
+
+// Recorre todos los atributos porque el primero de un tipo puede ser otro stream.
+static ATTRIBUTE_RECORD_HEADER * BuscarAtributoExactoEnRegistro(
+	unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo,
+	const char * Nombre, int Id=-1, VCN LowestVcn=0, bool CompararVcn=false) {
+	FILE_RECORD_SEGMENT_HEADER * Encabezado=
+		reinterpret_cast<FILE_RECORD_SEGMENT_HEADER *>(Registro);
+	unsigned Offset=Encabezado->FirstAttributeOffset;
+	while (Offset+sizeof(ATTRIBUTE_TYPE_CODE)<=TamanoRegistro) {
+		ATTRIBUTE_RECORD_HEADER * Atributo=
+			reinterpret_cast<ATTRIBUTE_RECORD_HEADER *>(Registro+Offset);
+		if (Atributo->TypeCode==NTFS_STRUCT_END) break;
+		if (!Atributo->RecordLength || Offset+Atributo->RecordLength>TamanoRegistro) break;
+
+		bool CoincideVcn=!CompararVcn ||
+			(Atributo->NonResidentFlag ?
+			 Atributo->Form.NonResident.FirstVCN==LowestVcn : LowestVcn==0);
+		if (Atributo->TypeCode==Tipo && AtributoCoincideNombre(Atributo, Nombre) &&
+		    (Id<0 || Atributo->AttributeId==(USHORT)Id) && CoincideVcn)
+			return Atributo;
+		Offset+=Atributo->RecordLength;
 	}
-	return Nombre[Atributo->NameLength] == '\0';
+	return NULL;
 }
 
 /* El bit 1 de FILE_RECORD_SEGMENT_HEADER.Flags marca los registros que son directorios */
@@ -490,28 +512,39 @@ static bool RegistroEsDirectorio(const unsigned char * Registro) {
 // registros de extensión. Devuelve el puntero al atributo.
 ATTRIBUTE_RECORD_HEADER * TDriverNTFS::BuscarAtributoEnLista(unsigned char * Registro, unsigned TamanoRegistro,
 					ATTRIBUTE_TYPE_CODE Tipo, const char * Nombre, std::vector<unsigned char> & BufferExtension) {
+	BufferExtension.clear();
 
-	// Primero, está en el registro base?
-	ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(Registro, TamanoRegistro, Tipo);
-	if (Atributo && AtributoCoincideNombre(Atributo, Nombre)) return Atributo;
+	ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributoExactoEnRegistro(
+		Registro, TamanoRegistro, Tipo, Nombre, -1, 0, true);
+	if (Atributo) return Atributo;
 
 	// Si los archivos muy grandes guardan algunos atributos en registros de extensión.
-	ATTRIBUTE_RECORD_HEADER * AttrLista = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
+	ATTRIBUTE_RECORD_HEADER * AttrLista = BuscarAtributo(
+		Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
 	if (!AttrLista) return NULL;
 
 	std::vector<unsigned char> Contenido;
 	if (LeerContenidoAtributo(AttrLista, Contenido) != CODERROR_NINGUNO) return NULL;
-	for (unsigned Offset = 0; Offset + 26 <= Contenido.size(); ) {
+	for (unsigned Offset=0; Offset+26<=Contenido.size(); ) {
 		const ATTRIBUTE_LIST_ENTRY * Entrada = reinterpret_cast<const ATTRIBUTE_LIST_ENTRY *>(Contenido.data() + Offset);
-		if (Entrada->TypeCode == NTFS_STRUCT_END || Entrada->RecordLength < 26 || Offset + Entrada->RecordLength > Contenido.size()) break;
-		if (Entrada->TypeCode == Tipo) {
+		if (Entrada->TypeCode==NTFS_STRUCT_END || Entrada->RecordLength<26 ||
+		    Offset+Entrada->RecordLength>Contenido.size()) break;
+		const WCHAR *NombreEntrada=reinterpret_cast<const WCHAR *>(
+			reinterpret_cast<const unsigned char *>(Entrada)+Entrada->AttributeNameOffset);
+		TString TextoNombre=Entrada->AttributeNameLength ?
+			UTF16aUTF8(NombreEntrada, Entrada->AttributeNameLength) : TString();
+		if (Entrada->TypeCode == Tipo && TextoNombre==(Nombre ? Nombre : "") &&
+		    Entrada->LowestVcn==0) {
 			// Carga el registro que contiene el atributo y lo busca en ese lugar.
 			std::vector<unsigned char> RegistroExtension;
 			if (LeerRegistroMFT(Entrada->SegmentReference.MFTIndex, RegistroExtension) == CODERROR_NINGUNO) {
-				ATTRIBUTE_RECORD_HEADER * Hallado = BuscarAtributo(RegistroExtension.data(), RegistroExtension.size(), Tipo);
-				if (Hallado && AtributoCoincideNombre(Hallado, Nombre)) {
+				ATTRIBUTE_RECORD_HEADER * Hallado = BuscarAtributoExactoEnRegistro(
+					RegistroExtension.data(), RegistroExtension.size(), Tipo, Nombre,
+					Entrada->Reserved, Entrada->LowestVcn, true);
+				if (Hallado) {
+					size_t OffsetHallado=reinterpret_cast<unsigned char *>(Hallado)-RegistroExtension.data();
 					BufferExtension = std::move(RegistroExtension);
-					return Hallado;
+					return reinterpret_cast<ATTRIBUTE_RECORD_HEADER *>(BufferExtension.data()+OffsetHallado);
 				}
 			}
 		}
@@ -525,40 +558,81 @@ ATTRIBUTE_RECORD_HEADER * TDriverNTFS::BuscarAtributoEnLista(unsigned char * Reg
 int TDriverNTFS::ObtenerDataRunsAtributo(unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo,
 										 const char * Nombre, std::vector<TDataRun> & DataRuns) {
 	DataRuns.clear();
+	struct TFragmento {
+		VCN Primero;
+		std::vector<TDataRun> Runs;
+	};
+	std::vector<TFragmento> Fragmentos;
 
-	// Este es el caso simple, no hay lista de atributos, entonces, todo está en el registro base.
-	ATTRIBUTE_RECORD_HEADER * AttrLista = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
-	if (!AttrLista) {
-		ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(Registro, TamanoRegistro, Tipo);
-		if (!Atributo || !Atributo->NonResidentFlag || !AtributoCoincideNombre(Atributo, Nombre)) return CODERROR_NO_ENCONTRADO;
-		return DecodificarDataRuns(Atributo, DataRuns);
-	}
-
-	// Este sería el caso más difícil, recorrer la lista de atributos.
-	std::vector<unsigned char> Contenido;
-	int CodError = LeerContenidoAtributo(AttrLista, Contenido);
-	if (CodError != CODERROR_NINGUNO) return CodError;
-	for (unsigned Offset = 0; Offset + 26 <= Contenido.size(); ) {
-		const ATTRIBUTE_LIST_ENTRY * Entrada = reinterpret_cast<const ATTRIBUTE_LIST_ENTRY *>(Contenido.data() + Offset);
-		if (Entrada->TypeCode == NTFS_STRUCT_END || Entrada->RecordLength < 26 || Offset + Entrada->RecordLength > Contenido.size()) break;
-
-		// Sólo el fragmento con LowestVcn = 0 arranca desde el principio, si no, acumulan clusters y se procesan en el orden de la lstita.
-		if (Entrada->TypeCode == Tipo) {
-			std::vector<unsigned char> RegistroFragmento;
-			if (LeerRegistroMFT(Entrada->SegmentReference.MFTIndex, RegistroFragmento) != CODERROR_NINGUNO) return CODERROR_FILESYSTEM_CORRUPTO;
-
-			// El registro base también aparece en la lista, vovler a cargarlo no hace nada.
-			ATTRIBUTE_RECORD_HEADER * Atributo = BuscarAtributo(RegistroFragmento.data(), RegistroFragmento.size(), Tipo);
-			if (!Atributo || !Atributo->NonResidentFlag || !AtributoCoincideNombre(Atributo, Nombre)) return CODERROR_FILESYSTEM_CORRUPTO;
-			std::vector<TDataRun> RunsFragmento;
-			CodError = DecodificarDataRuns(Atributo, RunsFragmento);
-			if (CodError != CODERROR_NINGUNO) return CodError;
-
-			DataRuns.insert(DataRuns.end(), RunsFragmento.begin(), RunsFragmento.end());
+	auto AgregarAtributo = [&](ATTRIBUTE_RECORD_HEADER *Atributo) -> int {
+		if (!Atributo || !Atributo->NonResidentFlag)
+			return CODERROR_FILESYSTEM_CORRUPTO;
+		TFragmento Fragmento={};
+		Fragmento.Primero=Atributo->Form.NonResident.FirstVCN;
+		for (const TFragmento &Existente : Fragmentos) {
+			if (Existente.Primero==Fragmento.Primero)
+				return CODERROR_NINGUNO;
 		}
-		Offset += Entrada->RecordLength;
+		int CodError=DecodificarDataRuns(Atributo, Fragmento.Runs);
+		if (CodError!=CODERROR_NINGUNO) return CodError;
+		Fragmentos.push_back(std::move(Fragmento));
+		return CODERROR_NINGUNO;
+	};
+
+	// Junta todos los fragmentos del stream que estén en el registro base.
+	FILE_RECORD_SEGMENT_HEADER *Encabezado=
+		reinterpret_cast<FILE_RECORD_SEGMENT_HEADER *>(Registro);
+	unsigned OffsetAtributo=Encabezado->FirstAttributeOffset;
+	while (OffsetAtributo+sizeof(ATTRIBUTE_TYPE_CODE)<=TamanoRegistro) {
+		ATTRIBUTE_RECORD_HEADER *Atributo=
+			reinterpret_cast<ATTRIBUTE_RECORD_HEADER *>(Registro+OffsetAtributo);
+		if (Atributo->TypeCode==NTFS_STRUCT_END) break;
+		if (!Atributo->RecordLength || OffsetAtributo+Atributo->RecordLength>TamanoRegistro)
+			return CODERROR_FILESYSTEM_CORRUPTO;
+		if (Atributo->TypeCode==Tipo && AtributoCoincideNombre(Atributo, Nombre)) {
+			int CodError=AgregarAtributo(Atributo);
+			if (CodError!=CODERROR_NINGUNO) return CodError;
+		}
+		OffsetAtributo+=Atributo->RecordLength;
 	}
-	if (DataRuns.empty()) return CODERROR_NO_ENCONTRADO;
+
+	ATTRIBUTE_RECORD_HEADER *AttrLista=BuscarAtributo(
+		Registro, TamanoRegistro, NTFS_STRUCT_ATTRIBUTE_LIST);
+	if (AttrLista) {
+		std::vector<unsigned char> Contenido;
+		int CodError=LeerContenidoAtributo(AttrLista, Contenido);
+		if (CodError!=CODERROR_NINGUNO) return CodError;
+		for (unsigned Offset=0; Offset+26<=Contenido.size(); ) {
+			const ATTRIBUTE_LIST_ENTRY *Entrada=
+				reinterpret_cast<const ATTRIBUTE_LIST_ENTRY *>(Contenido.data()+Offset);
+			if (Entrada->TypeCode==NTFS_STRUCT_END || Entrada->RecordLength<26 ||
+			    Offset+Entrada->RecordLength>Contenido.size()) break;
+
+			const WCHAR *NombreEntrada=reinterpret_cast<const WCHAR *>(
+				reinterpret_cast<const unsigned char *>(Entrada)+Entrada->AttributeNameOffset);
+			TString TextoNombre=Entrada->AttributeNameLength ?
+				UTF16aUTF8(NombreEntrada, Entrada->AttributeNameLength) : TString();
+			if (Entrada->TypeCode==Tipo && TextoNombre==(Nombre ? Nombre : "")) {
+				std::vector<unsigned char> RegistroFragmento;
+				CodError=LeerRegistroMFT(Entrada->SegmentReference.MFTIndex, RegistroFragmento);
+				if (CodError!=CODERROR_NINGUNO) return CodError;
+				ATTRIBUTE_RECORD_HEADER *Atributo=BuscarAtributoExactoEnRegistro(
+					RegistroFragmento.data(), RegistroFragmento.size(), Tipo, Nombre,
+					Entrada->Reserved, Entrada->LowestVcn, true);
+				if (!Atributo) return CODERROR_FILESYSTEM_CORRUPTO;
+				CodError=AgregarAtributo(Atributo);
+				if (CodError!=CODERROR_NINGUNO) return CodError;
+			}
+			Offset+=Entrada->RecordLength;
+		}
+	}
+
+	if (Fragmentos.empty()) return CODERROR_NO_ENCONTRADO;
+	std::sort(Fragmentos.begin(), Fragmentos.end(),
+		[](const TFragmento &A, const TFragmento &B) { return A.Primero<B.Primero; });
+	for (const TFragmento &Fragmento : Fragmentos) {
+		DataRuns.insert(DataRuns.end(), Fragmento.Runs.begin(), Fragmento.Runs.end());
+	}
 	return CODERROR_NINGUNO;
 }
 
@@ -584,45 +658,51 @@ int TDriverNTFS::CargarNodoIndice(__u64 VCN, const std::vector<TDataRun> & DataR
 	return(CODERROR_NINGUNO);
 }
 
-// Esta función recorre las entradas de un nodo del índice en preorder. Ojo que los nodos internos también guardan entradas reales.
+// Recorre las entradas de un nodo en orden de árbol B: hijo izquierdo y luego clave.
 int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigned OffsetEncabezado, const std::vector<TDataRun> & DataRunsAllocacion,
 	unsigned TamanoNodoIndice, TpColectoraDatosIndice pFuncion, void * pParametroUsuario, unsigned Nivel) {
 
-        if (!Nodo || Nivel > 64 || OffsetEncabezado + sizeof(IDX_HEADER)>TamanoNodo) return CODERROR_FILESYSTEM_CORRUPTO;
+	if (!Nodo || Nivel>64 || OffsetEncabezado+sizeof(IDX_HEADER)>TamanoNodo)
+		return CODERROR_FILESYSTEM_CORRUPTO;
 
-        IDX_HEADER * Encabezado = reinterpret_cast<IDX_HEADER *>(Nodo + OffsetEncabezado);
-        unsigned Offset = OffsetEncabezado + Encabezado->OffsetFirstEntry;
-        unsigned Fin = OffsetEncabezado + Encabezado->IndexEntriesUsed;
-        while (Offset + offsetof(INDEX_RECORD, Data) <= Fin && Offset + offsetof(INDEX_RECORD, Data) <= TamanoNodo) {
-			INDEX_RECORD * Entrada = reinterpret_cast<INDEX_RECORD *>(Nodo + Offset);
-			if (Entrada->RecordLength<offsetof(INDEX_RECORD, Data) || Offset + Entrada->RecordLength>TamanoNodo) return CODERROR_FILESYSTEM_CORRUPTO;
+	IDX_HEADER * Encabezado=reinterpret_cast<IDX_HEADER *>(Nodo+OffsetEncabezado);
+	unsigned Offset=OffsetEncabezado+Encabezado->OffsetFirstEntry;
+	unsigned Fin=OffsetEncabezado+Encabezado->IndexEntriesUsed;
+	while (Offset+offsetof(INDEX_RECORD, Data)<=Fin &&
+	       Offset+offsetof(INDEX_RECORD, Data)<=TamanoNodo) {
+		INDEX_RECORD * Entrada=reinterpret_cast<INDEX_RECORD *>(Nodo+Offset);
+		if (Entrada->RecordLength<offsetof(INDEX_RECORD, Data) ||
+		    Offset+Entrada->RecordLength>TamanoNodo)
+			return CODERROR_FILESYSTEM_CORRUPTO;
 
-			// Primero se reporta la entrada.
-			if (!(Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) && Entrada->StreamLength > 0) {
-				int CodError = (this->*pFuncion)(Entrada, pParametroUsuario);
-				if (CodError != CODERROR_NINGUNO) return CodError;
+		/* El puntero guardado en una entrada lleva al hijo que contiene las
+		 * claves menores que esa entrada. Por eso se desciende antes de
+		 * reportar la clave; en la entrada final está el hijo derecho. */
+		if (Entrada->Flags & NTFS_INDEX_ENTRADA_TIENE_SUBNODO) {
+			ULONGLONG VCN;
+			memcpy(&VCN, reinterpret_cast<unsigned char *>(Entrada)+
+				Entrada->RecordLength-sizeof(ULONGLONG), sizeof(VCN));
+			std::vector<unsigned char> Subnodo;
+			int CodError=CargarNodoIndice(VCN, DataRunsAllocacion, TamanoNodoIndice, Subnodo);
+			if (CodError!=CODERROR_NINGUNO) return CodError;
+			CodError=EnumerarNodo(Subnodo.data(), Subnodo.size(),
+				offsetof(FILE_RECORD_INDEX_HEADER, Header), DataRunsAllocacion,
+				TamanoNodoIndice, pFuncion, pParametroUsuario, Nivel+1);
+			if (CodError!=CODERROR_NINGUNO) return CodError;
+		}
+
+		if (!(Entrada->Flags & NTFS_INDEX_ENTRADA_FIN)) {
+			if (Entrada->StreamLength>0) {
+				int CodError=(this->*pFuncion)(Entrada, pParametroUsuario);
+				if (CodError!=CODERROR_NINGUNO) return CodError;
 			}
+		} else {
+			break;
+		}
 
-			// Ahora, si la entrada tiene putnero, se baja al subnodo.
-			if (Entrada->Flags & NTFS_INDEX_ENTRADA_TIENE_SUBNODO) {
-				if (Entrada->RecordLength<sizeof(ULONGLONG)) return CODERROR_FILESYSTEM_CORRUPTO;
-
-				ULONGLONG VCN;
-				memcpy(&VCN, reinterpret_cast<unsigned char *>(Entrada) + Entrada->RecordLength-sizeof(ULONGLONG), sizeof(VCN));
-				std::vector<unsigned char> Subnodo;
-				int CodError = CargarNodoIndice(VCN, DataRunsAllocacion, TamanoNodoIndice, Subnodo);
-				if (CodError != CODERROR_NINGUNO) return CodError;
-
-				// En un buffer de índice, el idx header está dentro del offset 24.
-				CodError = EnumerarNodo(Subnodo.data(), Subnodo.size(), offsetof(FILE_RECORD_INDEX_HEADER, Header), DataRunsAllocacion, TamanoNodoIndice,
-										pFuncion, pParametroUsuario, Nivel + 1);
-				if (CodError != CODERROR_NINGUNO) return CodError;
-			}
-
-			if (Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) break;
-			Offset += Entrada->RecordLength;
-        }
-        return CODERROR_NINGUNO;
+		Offset+=Entrada->RecordLength;
+	}
+	return CODERROR_NINGUNO;
 }
 
 // Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leídoy tiene los fixup aplicados. El nodo raíz del árbol
@@ -632,10 +712,12 @@ int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistr
 	std::vector<unsigned char> BufferExtension;
 	unsigned char * NodoRaiz = Registro;
 	unsigned TamanoRaiz = TamanoRegistro;
-	ATTRIBUTE_RECORD_HEADER * IndexRoot = BuscarAtributo(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT);
+	ATTRIBUTE_RECORD_HEADER * IndexRoot=BuscarAtributo(
+		Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT);
 
 	if (!IndexRoot) {
-		IndexRoot = BuscarAtributoEnLista(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT, "$I30", BufferExtension);
+		IndexRoot=BuscarAtributoEnLista(
+			Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ROOT, "$I30", BufferExtension);
 		if (!IndexRoot) return CODERROR_FILESYSTEM_CORRUPTO;
 		NodoRaiz = BufferExtension.data();
 		TamanoRaiz = BufferExtension.size();
@@ -644,8 +726,9 @@ int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistr
 
 	unsigned OffsetAtributo = (unsigned)(reinterpret_cast<unsigned char *>(IndexRoot) - NodoRaiz);
 	unsigned OffsetValor = OffsetAtributo + IndexRoot->Form.Resident.ValueOffset;
-	if (IndexRoot->Form.Resident.ValueOffset + IndexRoot->Form.Resident.ValueLength>IndexRoot->RecordLength ||
-		OffsetValor + sizeof(IDX_ROOT) + sizeof(IDX_HEADER) > TamanoRaiz) return CODERROR_FILESYSTEM_CORRUPTO;
+	if (IndexRoot->Form.Resident.ValueOffset+IndexRoot->Form.Resident.ValueLength>
+		IndexRoot->RecordLength || OffsetValor+sizeof(IDX_ROOT)+sizeof(IDX_HEADER)>TamanoRaiz)
+		return CODERROR_FILESYSTEM_CORRUPTO;
 
 	const IDX_ROOT *Raiz=reinterpret_cast<const IDX_ROOT *>(NodoRaiz+OffsetValor); // Es de este índice nomás, no siempre coincide con el boot.
 	unsigned TamanoNodoIndice = Raiz->IndexAllocationEntrySize;
@@ -654,9 +737,10 @@ int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistr
 	// Si el índice es chico, el atributo no existe y sus entradas están en el index_root.
 	std::vector<TDataRun> DataRunsAllocacion;
 	int CodError = ObtenerDataRunsAtributo(Registro, TamanoRegistro, NTFS_STRUCT_INDEX_ALLOCATION, "$I30", DataRunsAllocacion);
-	if (CodError == CODERROR_FILESYSTEM_CORRUPTO) return CodError;
+	if (CodError==CODERROR_FILESYSTEM_CORRUPTO) return CodError;
 	unsigned OffsetEncabezado = OffsetValor + sizeof(IDX_ROOT);
-	return EnumerarNodo(NodoRaiz, TamanoRaiz, OffsetEncabezado, DataRunsAllocacion, TamanoNodoIndice, pFuncion, pParametroUsuario, 0);
+	return EnumerarNodo(NodoRaiz, TamanoRaiz, OffsetEncabezado,
+		DataRunsAllocacion, TamanoNodoIndice, pFuncion, pParametroUsuario, 0);
 }
 
 // Por cada index records, arma una entrada. Todos los datos salen del file name que está en la propia entrada del índice.
@@ -786,7 +870,72 @@ int TDriverNTFS::ListarDirectorio(const char *Path, std::vector<TEntradaDirector
  ****************************************************************************************************************************************/
 int TDriverNTFS::LeerArchivo(const char *Path, unsigned char *&Data, unsigned &DataLen)
 {
-/* Salir */
-return(CODERROR_NO_IMPLEMENTADO);
+	Data=NULL;
+	DataLen=0;
+	if (!Path || Path[0]!='/') return CODERROR_RUTA_NO_ABSOLUTA;
+
+	/* Un ':' sólo introduce un stream cuando aparece en el último componente.
+	 * La parte anterior se resuelve como un path NTFS normal. */
+	TString RutaArchivo(Path);
+	size_t UltimaBarra=RutaArchivo.rfind('/');
+	size_t SeparadorStream=RutaArchivo.find(':',
+		UltimaBarra==TString::npos ? 0 : UltimaBarra+1);
+	TString NombreStream;
+	if (SeparadorStream!=TString::npos) {
+		NombreStream=RutaArchivo.substr(SeparadorStream+1);
+		RutaArchivo.resize(SeparadorStream);
+	}
+
+	__u64 IndiceMFT=0;
+	int CodError=ResolverPath(RutaArchivo.c_str(), IndiceMFT);
+	if (CodError==CODERROR_DIRECTORIO_INEXISTENTE)
+		return CODERROR_ARCHIVO_INEXISTENTE;
+	if (CodError!=CODERROR_NINGUNO) return CodError;
+
+	std::vector<unsigned char> Registro;
+	CodError=LeerRegistroMFT(IndiceMFT, Registro);
+	if (CodError!=CODERROR_NINGUNO) return CodError;
+	if (RegistroEsDirectorio(Registro.data())) return CODERROR_ARCHIVO_INEXISTENTE;
+
+	std::vector<unsigned char> BufferExtension;
+	ATTRIBUTE_RECORD_HEADER *Atributo=BuscarAtributoEnLista(
+		Registro.data(), Registro.size(), NTFS_STRUCT_DATA,
+		NombreStream.c_str(), BufferExtension);
+	if (!Atributo) return CODERROR_ARCHIVO_INEXISTENTE;
+
+	if (!Atributo->NonResidentFlag) {
+		unsigned Offset=Atributo->Form.Resident.ValueOffset;
+		unsigned Tamano=Atributo->Form.Resident.ValueLength;
+		Data=static_cast<unsigned char *>(malloc(Tamano ? Tamano : 1));
+		if (!Data) return CODERROR_FALTA_MEMORIA;
+		if (Tamano)
+			memcpy(Data, reinterpret_cast<unsigned char *>(Atributo)+Offset, Tamano);
+		DataLen=Tamano;
+		return CODERROR_NINGUNO;
+	}
+
+	ULONGLONG TamanoReal=Atributo->Form.NonResident.RealSize;
+	ULONGLONG TamanoInicializado=Atributo->Form.NonResident.InitializedSize;
+	if (TamanoReal>UINT_MAX) return CODERROR_FALTA_MEMORIA;
+
+	std::vector<TDataRun> DataRuns;
+	CodError=ObtenerDataRunsAtributo(Registro.data(), Registro.size(),
+		NTFS_STRUCT_DATA, NombreStream.c_str(), DataRuns);
+	if (CodError==CODERROR_NO_ENCONTRADO) return CODERROR_ARCHIVO_INEXISTENTE;
+	if (CodError!=CODERROR_NINGUNO) return CodError;
+
+	Data=static_cast<unsigned char *>(malloc(TamanoReal ? (size_t)TamanoReal : 1));
+	if (!Data) return CODERROR_FALTA_MEMORIA;
+	if (TamanoReal) memset(Data, 0, (size_t)TamanoReal);
+	if (TamanoInicializado) {
+		CodError=LeerDesdeDataRuns(DataRuns, 0, Data, TamanoInicializado);
+		if (CodError!=CODERROR_NINGUNO) {
+			free(Data);
+			Data=NULL;
+			return CodError;
+		}
+	}
+	DataLen=(unsigned)TamanoReal;
+	return CODERROR_NINGUNO;
 }
 
