@@ -389,12 +389,12 @@ int TDriverNTFS::LeerRegistroMFT(__u64 Indice, std::vector<unsigned char> &Regis
 
 /*
 	~~~ | ~~~
-	Primero vamos a comenzar por unas funciones auxiliares nashe. Estas son para traducir cosas del File System
-	al código, así se entienden mutuamente, como un traductor digamos.
+	Estas primeras funciones auxiliares son de propósito general. Son utilizadas para traducir formatos del File System
+	a uno más amigable para el código. Algo así como un "traductor".
 	~~~ | ~~~
 */
 
-// Esta bad bitch convierte un nombre UTF-16LE a uno UTF-8. O sea, de lo que usa la NFT a la que usa el código.
+// Esta función convierte un nombre UTF-16LE a uno UTF-8. Es decir, de lo que usa NTFS a lo que usa el código.
 static TString UTF16aUTF8(const WCHAR * Nombre, UCHAR Largo) {
 	TString Resultado;
 	Resultado.reserve(Largo);
@@ -422,15 +422,15 @@ static TString UTF16aUTF8(const WCHAR * Nombre, UCHAR Largo) {
 	return Resultado;
 }
 
-// Esta otra se encarga de mostrar el tiempo correctamente, porque NFTS guarda las fechas de forma diferente,
-// empezando desde el año 1600 y pico.
+// Esta otra función se encarga de mostrar el tiempo correctamente, porque NTFS guarda las fechas de forma
+// diferente, empezando alrededor del año 1600.
 static time_t TicksAFecha(ULONGLONG Ticks) {
-	// El numerito mágico. Esta es la cantidad de segundos entre el mil y pico y los 70.
+	// El número "mágico". Esta es la cantidad de segundos entre ese año y los 70s.
     const __s64 DiferenciaEntreEpochs=116444736000000000LL;
     return (time_t)(((__s64)Ticks - DiferenciaEntreEpochs) / 10000000LL);
 }
 
-// Esta también es útil, porque traduce los atributos de un registro a flags que entienda nuestro programa.
+// Esta función también es útil, porque traduce los atributos de un registro a flags que entienda nuestro programa.
 static unsigned TraducirFlags(ULONG FileAttributes) {
 	unsigned Flags = 0;
 	if (FileAttributes & NTFS_READ_ONLY) Flags |= fedSOLO_LECTURA;
@@ -446,13 +446,13 @@ static unsigned TraducirFlags(ULONG FileAttributes) {
 
 /*
 	~~~ | ~~~
-	Ahora vamos con las funciones auxiliares del árbol B Tree que usa internamente el sistema de NFTS para los
-	directorios. Después, seguirán las funciones propiamente dichas de eso.
+	Ahora vamos con las funciones auxiliares del árbol B-Tree que usa internamente el sistema de NTFS para los
+	directorios. Después, seguirán las funciones propiamente dichas de la búsqueda.
 	~~~ | ~~~
 */
 
-// Esta simplemente compara dos nombres ingnorando mayúsculas o minúsculas.
-// A la NFTS no le importa, es case-insensitive.
+// Esta función simplemente compara dos nombres ingnorando mayúsculas o minúsculas.
+// A NTFS no le importa si es mayúscula o minúscula, es case-insensitive.
 static bool NombresIguales(const TString & A, const TString & B) {
 	if (A.size() != B.size()) return false;
 	for (size_t i = 0; i < A.size(); i++) {
@@ -461,7 +461,7 @@ static bool NombresIguales(const TString & A, const TString & B) {
 	return true;
 }
 
-// Si el atributo no tiene nombre o coincide con el pedido, devuelve true.
+// Si el atributo no tiene nombre o coincide con el pedido, esta función devuelve true.
 static bool AtributoCoincideNombre(const ATTRIBUTE_RECORD_HEADER * Atributo, const char * Nombre) {
 	if (!Nombre || !Nombre[0]) return true; // O no me dieron un atributo o no me dieron un nombre. Nada para buscar.
 	if (Atributo->NameLength == 0) return false; // Me pidieron un nombre, pero el atributo no tiene nada.
@@ -472,8 +472,7 @@ static bool AtributoCoincideNombre(const ATTRIBUTE_RECORD_HEADER * Atributo, con
 	return Nombre[Atributo->NameLength] == '\0';
 }
 
-/* El bit 1 de FILE_RECORD_SEGMENT_HEADER.Flags marca los registros que son directorios */
-// Y esta otra te dice si el registro es un directorio o no.
+// Y esta otra función te dice si el registro es un directorio o no (True/False).
 static bool RegistroEsDirectorio(const unsigned char * Registro) {
 	const FILE_RECORD_SEGMENT_HEADER * Encabezado = reinterpret_cast<const FILE_RECORD_SEGMENT_HEADER *>(Registro);
 	return (Encabezado->Flags & NTFS_RECORD_ES_DIRECTORIO) != 0;
@@ -481,7 +480,7 @@ static bool RegistroEsDirectorio(const unsigned char * Registro) {
 
 /*
 	~~~ | ~~~
-	Estas son las funciones para poder recorrer los paths propiamente dichos. El NFTS funciona como un B Tree, entonces
+	Estas son las funciones para poder recorrer los paths propiamente dichos. El NTFS funciona como un B-Tree, entonces
 	es necesario implementar ese mismo tipo de lógica.
 	~~~ | ~~~
 */
@@ -625,7 +624,7 @@ int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigne
         return CODERROR_NINGUNO;
 }
 
-// Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leídoy tiene los fixup aplicados. El nodo raíz del árbol
+// Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leído y tiene los fixup aplicados. El nodo raíz del árbol
 // vive en el index_root, como residete.
 int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistro, TpColectoraDatosIndice pFuncion, void * pParametroUsuario) {
 	// Como el index_root siempre es residente, si no está en el registro base, se busca en los de extensión.
@@ -746,7 +745,7 @@ int TDriverNTFS::ResolverPath(const char * Path, __u64 & IndiceMFT) {
 	return(CODERROR_NINGUNO);
 }
 
-// Y así llegamos a la tan esperada maldita...
+// Y así llegamos a la tan esperada función a implementar! ListarDirectorio()
 int TDriverNTFS::ListarDirectorio(const char *Path, std::vector<TEntradaDirectorio> &Entradas)
 {
 	Entradas.clear();
