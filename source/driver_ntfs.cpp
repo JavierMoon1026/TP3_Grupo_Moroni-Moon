@@ -75,11 +75,11 @@ int TDriverNTFS::LevantarDatosSuperbloque()
 	DatosFS.TipoFilesystem = tfsNTFS;
 	DatosFS.BytesPorSector = Boot->BytesPerSector;
 	DatosFS.BytesPorCluster = Boot->BytesPerSector * Boot->SectorsPerCluster;
-	// Acá había un error de reporte, estaba desfasado con 1 por debajo. Le sumás uno y chau.
+	// Se suma uno porque el sector cero tambien forma parte del volumen
 	DatosFS.NumeroDeClusters = Boot->SectorCount64 / Boot->SectorsPerCluster + 1;
 
 	TDatosFSNTFS &NTFS = DatosFS.DatosEspecificos.NTFS;
-	// Igual que arriba; desfasado con 1 por debajo. De nuevo, sumás uno y chau.
+	// Se aplica la misma correccion al informar la cantidad de sectores
 	NTFS.TotalSectores = Boot->SectorCount64 + 1;
 	NTFS.SectoresPorCluster = Boot->SectorsPerCluster;
 	NTFS.ClusterMFT = Boot->MasterFileTableCluster;
@@ -400,7 +400,7 @@ static TString UTF16aUTF8(const WCHAR * Nombre, UCHAR Largo) {
 	Resultado.reserve(Largo);
 	for (unsigned i = 0; i < Largo; ) {
 		unsigned Punto = Nombre[i++];
-		// Par sustituto, son dos WCHAR juntos codifican un punto de código mayor a 0xFFFF.
+		// Un par sustituto representa un punto de codigo mayor a 0xFFFF
 		if (Punto >= 0xD800 && Punto <= 0xDBFF && i < Largo && Nombre[i] >= 0xDC00 && Nombre[i] <= 0xDFFF)
 			Punto = 0x10000 + ((Punto - 0xD800) << 10) + (Nombre[i++] - 0xDC00);
 		if (Punto < 0x80) {
@@ -425,7 +425,7 @@ static TString UTF16aUTF8(const WCHAR * Nombre, UCHAR Largo) {
 // Esta otra función se encarga de mostrar el tiempo correctamente, porque NTFS guarda las fechas de forma
 // diferente, empezando alrededor del año 1600.
 static time_t TicksAFecha(ULONGLONG Ticks) {
-	// El número "mágico". Esta es la cantidad de segundos entre ese año y los 70s.
+	// Diferencia entre 1601 y 1970 medida en intervalos de 100 nanosegundos
     const __s64 DiferenciaEntreEpochs=116444736000000000LL;
     return (time_t)(((__s64)Ticks - DiferenciaEntreEpochs) / 10000000LL);
 }
@@ -446,13 +446,12 @@ static unsigned TraducirFlags(ULONG FileAttributes) {
 
 /*
 	~~~ | ~~~
-	Ahora vamos con las funciones auxiliares del árbol B-Tree que usa internamente el sistema de NTFS para los
+	Ahora vamos con las funciones auxiliares del árbol B+ que usa internamente el sistema de NTFS para los
 	directorios. Después, seguirán las funciones propiamente dichas de la búsqueda.
 	~~~ | ~~~
 */
 
-// Esta función simplemente compara dos nombres ingnorando mayúsculas o minúsculas.
-// A NTFS no le importa si es mayúscula o minúscula, es case-insensitive.
+// Esta función compara dos nombres ASCII ignorando mayúsculas o minúsculas.
 static bool NombresIguales(const TString & A, const TString & B) {
 	if (A.size() != B.size()) return false;
 	for (size_t i = 0; i < A.size(); i++) {
@@ -502,8 +501,8 @@ static bool RegistroEsDirectorio(const unsigned char * Registro) {
 
 /*
 	~~~ | ~~~
-	Estas son las funciones para poder recorrer los paths propiamente dichos. El NTFS funciona como un B-Tree, entonces
-	es necesario implementar ese mismo tipo de lógica.
+	Estas son las funciones para poder recorrer los paths propiamente dichos. NTFS usa un árbol B+ para los directorios,
+	por eso es necesario implementar ese mismo tipo de lógica.
 	~~~ | ~~~
 */
 
@@ -552,8 +551,8 @@ ATTRIBUTE_RECORD_HEADER * TDriverNTFS::BuscarAtributoEnLista(unsigned char * Reg
 	return NULL;
 }
 
-// Esta función consigue los DataRuns completos de un atributo que se no residente. Si tuviera un attribute list,
-// se recorren todos sus fragmentos y se concatenan sus DataRuns.
+// Esta función consigue los Data Runs completos de un atributo no residente. Si tiene una attribute list,
+// se recorren todos sus fragmentos y se concatenan sus Data Runs.
 int TDriverNTFS::ObtenerDataRunsAtributo(unsigned char * Registro, unsigned TamanoRegistro, ATTRIBUTE_TYPE_CODE Tipo,
 										 const char * Nombre, std::vector<TDataRun> & DataRuns) {
 	DataRuns.clear();
@@ -635,8 +634,8 @@ int TDriverNTFS::ObtenerDataRunsAtributo(unsigned char * Registro, unsigned Tama
 	return CODERROR_NINGUNO;
 }
 
-// Esta función carga en memoria todo el nodo apuntado por el VCN de una entrada con subnodo. Ojo que el VCN está en unidades de cluster,
-// entonces el offeset dentro del index allocation es con una operación matemática adicional.
+// Carga el nodo apuntado por el VCN de una entrada con subnodo
+// El VCN esta medido en clusters dentro del index allocation
 int TDriverNTFS::CargarNodoIndice(__u64 VCN, const std::vector<TDataRun> & DataRunsAllocacion,
 								 unsigned TamanoNodoIndice, std::vector<unsigned char> & Nodo) {
 	if (TamanoNodoIndice<(unsigned)DatosFS.BytesPorSector || TamanoNodoIndice % (unsigned)DatosFS.BytesPorSector != 0 ||
@@ -657,7 +656,7 @@ int TDriverNTFS::CargarNodoIndice(__u64 VCN, const std::vector<TDataRun> & DataR
 	return(CODERROR_NINGUNO);
 }
 
-// Recorre las entradas de un nodo en orden de árbol B: hijo izquierdo y luego clave.
+// Recorre las entradas del arbol B+ en orden: hijo izquierdo y luego clave
 int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigned OffsetEncabezado, const std::vector<TDataRun> & DataRunsAllocacion,
 	unsigned TamanoNodoIndice, TpColectoraDatosIndice pFuncion, void * pParametroUsuario, unsigned Nivel) {
 
@@ -704,10 +703,10 @@ int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigne
 	return CODERROR_NINGUNO;
 }
 
-// Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leído y tiene los fixup aplicados. El nodo raíz del árbol
-// vive en el index_root, como residete.
+// Esta función recorre el índice I30 de un directorio cuyo registro MFT ya fue leído y tiene los fixups aplicados.
+// El nodo raíz del árbol vive en index_root como residente.
 int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistro, TpColectoraDatosIndice pFuncion, void * pParametroUsuario) {
-	// Como el index_root siempre es residente, si no está en el registro base, se busca en los de extensión.
+	// Como index_root siempre es residente, si no está en el registro base se busca en los de extensión.
 	std::vector<unsigned char> BufferExtension;
 	unsigned char * NodoRaiz = Registro;
 	unsigned TamanoRaiz = TamanoRegistro;
@@ -742,7 +741,7 @@ int TDriverNTFS::EnumerarIndice(unsigned char * Registro, unsigned TamanoRegistr
 		DataRunsAllocacion, TamanoNodoIndice, pFuncion, pParametroUsuario, 0);
 }
 
-// Por cada index records, arma una entrada. Todos los datos salen del file name que está en la propia entrada del índice.
+// Por cada index record, arma una entrada. Todos los datos salen del file name de la propia entrada del índice.
 int TDriverNTFS::ColectoraListarEntradas(INDEX_RECORD * EntradaIndice, void * pParametroUsuario) {
 	std::vector<TEntradaDirectorio> * Entradas = reinterpret_cast<std::vector<TEntradaDirectorio> *>(pParametroUsuario);
 	if (EntradaIndice->StreamLength < offsetof(FILE_NAME, FileName)) return CODERROR_FILESYSTEM_CORRUPTO;
@@ -766,7 +765,7 @@ int TDriverNTFS::ColectoraListarEntradas(INDEX_RECORD * EntradaIndice, void * pP
 	return CODERROR_NINGUNO;
 }
 
-// Esta otra función compara el nombre de cada entrada del índice con el componente de path buscado. Igual que antes, es case-insensitve.
+// Esta función compara el nombre de cada entrada del índice con el componente del path buscado.
 int TDriverNTFS::ColectoraBuscarNombre(INDEX_RECORD *EntradaIndice, void * pParametroUsuario) {
 	TBusquedaNombre * Busqueda = reinterpret_cast<TBusquedaNombre *>(pParametroUsuario);
 	if (Busqueda->Encontrado) return CODERROR_NINGUNO;
@@ -806,7 +805,7 @@ int TDriverNTFS::ResolverPath(const char * Path, __u64 & IndiceMFT) {
 		TString Componente(Inicio, Fin - Inicio);
 		Inicio = Fin;
 
-		// Ahora, buscamos el componente en el índice del directorio acutal.
+		// Busca el componente en el indice del directorio actual
 		TBusquedaNombre Busqueda;
 		Busqueda.Nombre = Componente;
 		Busqueda.Encontrado = false;
@@ -829,7 +828,7 @@ int TDriverNTFS::ResolverPath(const char * Path, __u64 & IndiceMFT) {
 	return(CODERROR_NINGUNO);
 }
 
-// Y así llegamos a la tan esperada función a implementar! ListarDirectorio()
+// Implementacion de ListarDirectorio
 int TDriverNTFS::ListarDirectorio(const char *Path, std::vector<TEntradaDirectorio> &Entradas)
 {
 	Entradas.clear();
