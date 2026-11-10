@@ -52,9 +52,7 @@
 #define	NTFS_DIRECTORY				0x10000000	// Directory (copy from corresponding bit in MFT record)
 #define	NTFS_INDEX_VIEW				0x20000000	// Index View (copy from corresponding bit in MFT record)
 
-/*
-	Esto lo necesitaba agregar para la parte 2. Queda más lindo.
-*/
+/* Flags usados para recorrer los indices de directorio */
 // Flags del encabezado de un registro del $MFT (FILE_RECORD_SEGMENT_HEADER.Flags).
 #define NTFS_RECORD_ES_DIRECTORIO 0x0002 // El registro es un directorio (tiene índice $I30).
 
