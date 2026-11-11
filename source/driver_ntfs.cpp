@@ -673,9 +673,14 @@ int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigne
 		    Offset+Entrada->RecordLength>TamanoNodo)
 			return CODERROR_FILESYSTEM_CORRUPTO;
 
-		/* El puntero guardado en una entrada lleva al hijo que contiene las
-		 * claves menores que esa entrada. Por eso se desciende antes de
-		 * reportar la clave; en la entrada final está el hijo derecho. */
+		if (!(Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) &&
+		    Entrada->StreamLength>0) {
+			int CodError=(this->*pFuncion)(Entrada, pParametroUsuario);
+			if (CodError!=CODERROR_NINGUNO) return CodError;
+		}
+
+		/* La entrada actual se reporta antes de recorrer su subnodo.
+		 * La entrada final no se reporta, pero puede contener el hijo derecho. */
 		if (Entrada->Flags & NTFS_INDEX_ENTRADA_TIENE_SUBNODO) {
 			ULONGLONG VCN;
 			memcpy(&VCN, reinterpret_cast<unsigned char *>(Entrada)+
@@ -689,12 +694,7 @@ int TDriverNTFS::EnumerarNodo(unsigned char * Nodo, unsigned TamanoNodo, unsigne
 			if (CodError!=CODERROR_NINGUNO) return CodError;
 		}
 
-		if (!(Entrada->Flags & NTFS_INDEX_ENTRADA_FIN)) {
-			if (Entrada->StreamLength>0) {
-				int CodError=(this->*pFuncion)(Entrada, pParametroUsuario);
-				if (CodError!=CODERROR_NINGUNO) return CodError;
-			}
-		} else {
+		if (Entrada->Flags & NTFS_INDEX_ENTRADA_FIN) {
 			break;
 		}
 
